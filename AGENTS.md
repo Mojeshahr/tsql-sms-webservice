@@ -1,120 +1,220 @@
-# Agent guide
+# Working with this repository
 
-Runnable T-SQL examples for the Payam Resan SMS web service. One script per API
-method, plus an outbox pattern that is the recommended production route.
+You are looking at T-SQL examples for the **Payam Resan** SMS web service
+(`api.sms-webservice.com`, API V3), an Iranian SMS provider. Someone is probably
+asking you to send SMS from inside SQL Server — usually from an ERP, accounting
+or clinic system where the business logic already lives in the database.
 
-## Rule one: this repository cannot be run here
+Before you write anything, read the next two sections. This repository has a
+recommended route and a discouraged one, and the discouraged one is the one that
+looks easier.
+
+## Read this first: these examples are parsed, not run
 
 Every other language repository in this organisation is verified by executing
-the examples. This one is not, and the reason is structural rather than
-temporary: `sp_OACreate` builds a COM object, COM is a Windows technology, and
-there is no SQL Server available on this machine at all.
+the examples. This one is not, and the reason is structural: `sp_OACreate`
+builds a COM object, COM is Windows-only, and there is no SQL Server on the
+machine where these are checked.
 
-What **is** verified, and what every change must keep passing, is a parse with
-Microsoft's own T-SQL parser:
+What is verified is a parse with Microsoft's own `ScriptDom`. That proves the
+syntax is valid for SQL Server. It proves nothing about whether the OLE calls
+succeed. Do not describe this repository as tested, and treat the first run on
+the user's instance as the real test.
 
-```bash
-docker run --rm -v "$PWD:/w:ro" tsql-check /w/examples/v3/*.sql /w/outbox/*.sql
+## Rule 1: prefer the outbox, not the inline call
+
+`outbox/` is the recommended production route, and the inline examples are for
+when you genuinely must send from inside a trigger or a procedure.
+
+The business logic calls `dbo.QueueSms`, which only inserts a row and returns
+its key; a SQL Agent job runs `03-send-outbox.ps1` every minute, batches the
+pending rows and posts `SendMultiple`.
+
+The load-bearing design decision is worth stating plainly: **the outbox table's
+key is the `UserTraceId` sent to the service.** After a timeout you can ask
+`StatusByUserTraceId` whether the message was registered, without storing the
+service's own id anywhere.
+
+What you gain: the business transaction never waits on the network, retries and
+attempt counts fall out naturally, and nothing has to be enabled on the database
+engine, because the sender lives outside SQL Server.
+
+What it costs: sending is up to a minute late rather than instant, SQL Server
+Express has no SQL Agent at all, and the sending half is PowerShell rather than
+T-SQL.
+
+**Never send directly from a trigger.** A trigger should call `dbo.QueueSms`.
+
+## Rule 2: what the inline route costs
+
+`Ole Automation Procedures` has to be enabled, and there are three consequences
+the user must accept before you write this code:
+
+1. It is enabled on the **whole SQL Server instance**. That is a sysadmin action
+   and it does not stop at this database.
+2. The COM object is created **inside the SQL Server process**. Skip
+   `sp_OADestroy` and you leak memory until the service restarts.
+3. **The call blocks.** If the service is slow to answer, the transaction that
+   called this code stays open just as long.
+
+```sql
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+EXEC sp_configure 'Ole Automation Procedures', 1;
+RECONFIGURE;
 ```
 
-The image is built from `mcr.microsoft.com/dotnet/sdk:8.0` plus the NuGet
-package `Microsoft.SqlServer.TransactSql.ScriptDom`, using `TSql160Parser`. That
-proves the syntax is valid for SQL Server. It proves nothing about whether the
-OLE calls succeed. Say so when reporting; do not describe this repository as
-tested.
+Start with `account-info.sql`: if it answers, the key is valid, OLE Automation
+is on, and the server can reach the internet.
 
-## Rule two: the key comes from a table, not the code
+## Rule 3: the version floor is per file, not per repository
 
-T-SQL has no environment variables, so the organisation-wide rule cannot be
-followed literally. The equivalent is `dbo.PayamResanSettings`, read at the top
-of every example:
+The baseline is SQL Server 2016, where `JSON_VALUE` and `OPENJSON` arrived. Two
+exceptions, and both are real:
+
+| File | Needs | Why |
+|---|---|---|
+| `status-by-id.sql`, `status-by-user-trace-id.sql` | 2017 | `STRING_AGG` — `Ids` is an array of numbers and `FOR JSON` only produces arrays of objects |
+| `send.sql` | 2019 | percent-encoding needs the UTF-8 bytes of the text, and UTF-8 collations arrived in 2019 |
+
+`send.sql` is also longer and more fragile than the alternative — use `SendBulk`
+unless there is a specific reason not to.
+
+`send-token-single-get.sql` stays at 2016 because all its values are ASCII. If a
+parameter turns Persian, take the encoding pattern from `send.sql`.
+
+## Rule 4: the key lives in a table, not the code
+
+T-SQL has no environment variables, so the "read the key from the environment"
+rule every other repository follows has no meaning here. The database equivalent
+is a settings table with restricted access:
 
 ```sql
 DECLARE @ApiKey nvarchar(100) = (SELECT TOP (1) ApiKey FROM dbo.PayamResanSettings);
 ```
 
-That table is the reader's own infrastructure, defined in the README, not a
-helper from this repository. Never write a key into the body of an example, and
-never commit a script carrying a real one.
+Three things follow: never write the key into the body of a procedure, take the
+`DENY SELECT` on that table seriously, and never commit a script that carries
+the real key.
 
-## Rule three: the examples are the documentation
+## Rule 5: read the response with `sp_OAMethod`, not `sp_OAGetProperty`
 
-Each file carries `-- docs:start` and `-- docs:end`. The region between them is
-lifted verbatim into the method's page on docs.payam-resan.com, so it is read by
-people who have never seen this repository.
-
-Two consequences:
-
-- **Full-line comments are stripped** when the region is lifted. Anything the
-  reader must see has to be code. The `Success` check is an `IF`, not a note.
-- The file name matches the reference page slug exactly: `send-bulk.sql`,
-  `status-by-user-trace-id.sql`. A path with two variants gets two files, the
-  plain name for `POST` and a `-get` suffix for `GET`.
-
-The full contract lives in the `handbook` repository, section `docs-site`, file
-`code-samples.md`.
-
-## Rule four: check Success, and always destroy the object
-
-The service answers `200` to everything, so the only signal is the envelope:
+Both work while the answer is short, but `sp_OAGetProperty` truncates long
+strings — and the answer from `TokenList` or `GetInbox` gets long easily. The
+truncation is silent, so the symptom is a JSON parse that returns null for no
+apparent reason.
 
 ```sql
+EXEC sp_OAMethod @Object, N'responseText', @Response OUTPUT;
+EXEC sp_OADestroy @Object;
+
 IF JSON_VALUE(@Response, N'$.Success') <> N'true'
+BEGIN
+    DECLARE @Error nvarchar(400) = CONCAT(
+        N'ناموفق. کد ', JSON_VALUE(@Response, N'$.ErrorCode'),
+        N': ', JSON_VALUE(@Response, N'$.Error'));
+    THROW 50000, @Error, 1;
+END;
 ```
 
-And `sp_OADestroy` runs in every example, before the check. A COM object left
-behind stays inside the SQL Server process until the service restarts. Put the
-destroy **before** the `THROW`, never after it.
+Note the order: **destroy the object before the `THROW`, never after it.** A
+`THROW` skips everything below it, so a destroy placed after the check leaks on
+exactly the path that fails most often.
 
-Read the body with `sp_OAMethod`, not `sp_OAGetProperty`: the latter truncates
-long strings, and `TokenList` and `GetInbox` return long ones.
+`JSON_VALUE` returns text, so `Success` is compared against the string
+`N'true'`.
 
-## Rule five: JSON arrays need JSON_QUERY
+## Rule 6: arrays need `JSON_QUERY`
 
-`FOR JSON` nested in a subquery embeds correctly, but a string built by hand
-does not: without `JSON_QUERY` it lands in the body as escaped text and the
-service silently fails to see an array. An array of bare numbers, as `Ids` and
-`UserTraceIds` need, has no `FOR JSON` form at all and is built with
-`STRING_AGG` inside `JSON_QUERY`.
+Without it the inner JSON string is embedded as escaped text, the service does
+not see an array, and there is no clear error to tell you so.
 
-## Rule six: state the version floor per file
+## Rule 7: `Success`, never the HTTP status
 
-The baseline is SQL Server 2016 for `JSON_VALUE` and `OPENJSON`. Two files sit
-higher and each says so in its own header: the two status files need 2017 for
-`STRING_AGG`, and `send.sql` needs 2019 for a UTF-8 collation, because
-percent-encoding requires the UTF-8 bytes and T-SQL has no built-in encoder.
+The service answers `200` to everything, including a wrong key and an empty
+account. Check the creation of the COM object separately — a non-zero status
+there usually means `Ole Automation Procedures` is off, not that the call
+failed.
 
-If a change raises a floor, write it in the file header **and** in the README
-table. A floor that is only in one of the two is how this gets wrong.
+## Rule 8: pick the right method
 
-## Rule seven: a version is a folder
+| The user wants | Use | File |
+|---|---|---|
+| one text to many people | `SendBulk` | `send-bulk.sql` |
+| a different text per person | `SendMultiple` | `send-multiple.sql` |
+| a one-time password or code | `SendTokenSingle` | `send-token-single.sql` |
+| a template to many people | `SendTokenMulti` | `send-token-multi.sql` |
+| delivery status | `StatusByUserTraceId` | `status-by-user-trace-id.sql` |
+| balance and sender lines | `AccountInfo` | `account-info.sql` |
 
-A new service version means a new `examples/v<n>/`. No file inside an existing
-version folder is moved or renamed; older versions still have users.
+**A one-time password goes through a template**, not free text — that is the
+usual route for OTP, and the template fixes the sender line, which is why
+`SendTokenSingle` takes no `Sender`. `token-list.sql` lists the account's
+templates; `Status` `2` means approved and sendable, `1` awaiting review, `3`
+rejected.
 
-## Secrets
+## Rule 9: phone numbers, the 99 cap, and `UserTraceId`
 
-No key, no real phone number and no customer name goes into a file here, not
-even a dead one. Example numbers are `9121112222` upward and the example key is
-`123456-XXXXXXXXXXXXXXX`.
+The service wants `9121112222` or `989121112222`. A number with a leading zero
+gets error `13`, and `dbo.QueueSms` rejects it before it ever reaches the
+service. Ninety-nine recipients per request is the ceiling for `SendBulk`,
+`SendMultiple` and `SendTokenMulti` — the outbox sender batches at exactly that.
 
-## Layout
+Always send a `UserTraceId`. After a timeout or error `100`, resending blind may
+send twice; `StatusByUserTraceId` is the only safe way to learn whether the
+message was registered. `StatusCode` of `8` means the id is not in the account,
+so it is safe to send again.
 
-| Path | What it holds |
-|---|---|
-| `examples/v3/` | one self-contained script per service operation, using `sp_OACreate` |
-| `outbox/` | schema, queueing procedure and PowerShell sender for the recommended pattern |
+`SendTokenSingle` is the exception: it has no such input, so its `UserTraceId`
+comes back null. If a trace id is needed for an OTP, use `SendTokenMulti` with a
+single recipient.
 
-## Before every commit
+## Rule 10: know which errors are worth retrying
 
-```bash
-docker run --rm -v "$PWD:/w:ro" tsql-check /w/examples/v3/*.sql /w/outbox/*.sql
-```
+These never succeed on retry — fix the cause; retrying only burns the rate limit
+until the account hits error `20`:
 
-The PowerShell sender in `outbox/` is checked the way the powershell repository
-checks its own files: it must start with a UTF-8 BOM and parse without errors.
+`1`, `2`, `3`, `6`, `8`, `9`, `10`, `11`, `12`, `13`, `14`, `19`
 
-## Git
+`19` is an empty balance; `10` means the SQL Server's outbound IP is not on the
+account's allowlist. Treat any unknown code the way you treat `100`: unclear
+outcome, check with `StatusByUserTraceId` before resending. The outbox caps
+attempts at five for the same reason.
 
-Semantic messages, `type(scope): subject`, with no explanatory body and no
-attribution trailer. Commits here are authored as Payam Resan.
+## Rule 11: delivery status is a poll, not a callback
+
+Status codes `0`, `1`, `2`, `3` and `10` mean still in flight — query again
+later, and not more often than every few minutes or you will hit error `20`. A
+SQL Agent job every minute is the usual way people trip this. Everything else is
+final. Branch on `StatusCode`, never on the `Status` text.
+
+## Rule 12: `GetInbox` consumes what it returns
+
+The service hands over each incoming message **once**. A job that fetches the
+inbox and then rolls back has destroyed those messages — write them inside the
+same transaction that reads them.
+
+The sender field is called `Form`, not `From`. That is the service's spelling.
+
+## Testing without spending credit
+
+Replace `V3` with `V3SandBox` in the URL. No message is sent and no credit is
+spent. `TokenList` is not implemented there.
+
+The sandbox is a simulator, not a mirror of the account: credit is always
+`1234567`, sender lines are invented, and **it accepts any key**. Success there
+proves nothing about the user's real key.
+
+## A note on the PowerShell sender
+
+`outbox/03-send-outbox.ps1` must be saved with a UTF-8 BOM. Without it, Windows
+PowerShell 5.1 reads it as ANSI and the Persian text breaks. It uses
+`System.Data.SqlClient` from .NET and needs no PowerShell module.
+
+## Where the authoritative answers are
+
+- Method reference and error tables: <https://docs.payam-resan.com>
+- Machine-readable OpenAPI: <https://github.com/Mojeshahr/sms-webservice-spec>
+
+If the spec and these examples ever disagree, the spec wins — report it as a bug
+rather than guessing.
